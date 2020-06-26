@@ -32,7 +32,10 @@
 //!
 //! ## Examples
 //! ```rust
-//! use log_derive::{logfn, logfn_inputs};
+//! #[macro_use]
+//! extern crate log_derive;
+//! #[macro_use]
+//! extern crate log;
 //!
 //! # #[derive(Debug)]
 //! struct Error;
@@ -44,8 +47,8 @@
 //! #[logfn(Warn)]
 //! #[logfn_inputs(Info, fmt = "Checking if {:?} is alive")]
 //! fn is_alive(person: &Person) -> Status {
-//!     # use Response::*;
-//!     # use Status::*;
+//!     # use self::Response::*;
+//!     # use self::Status::*;
 //!    match person.ping() {
 //!        Pong => Status::Alive,
 //!        Timeout => if person.is_awake() {
@@ -72,27 +75,17 @@
 //!     a + b
 //! }
 //!
-//! #[logfn_inputs(Info)]
-//! #[logfn(ok = "TRACE", log_ts = true)]
-//! fn time_this(num: &str) -> Result<Success, Error> {
-//!     if num.len() >= 10 && num.len() <= 15 {
-//!        std::thread::sleep(Duration::from_secs(1));
-//!         Ok(Success)
-//!     } else {
-//!         Err(Error)
-//!     }
-//! }
-//!
+//! # fn main() {}
 //! # enum Response {Pong, Timeout}
 //! # #[derive(Debug)]
 //! # struct Person;
 //! # impl Person {fn ping(&self) -> Response {Response::Pong}fn is_awake(&self) -> bool {true}}
-//! # use std::time::Duration;
 //! ```
 //!
 //!
 extern crate proc_macro;
 extern crate syn;
+
 use darling::{Error, FromMeta};
 use proc_macro2::TokenStream;
 use quote::{quote, ToTokens};
@@ -107,23 +100,19 @@ struct FormattedAttributes {
     ok_expr: TokenStream,
     err_expr: TokenStream,
     log_ts: bool,
-    contained_ok_or_err: bool,
 }
 
 impl FormattedAttributes {
-    pub fn parse_attributes(attr: &[NestedMeta], fmt_default: String) -> darling::Result<Self> {
-        OutputOptions::from_list(attr).map(|opts| Self::get_ok_err_streams(opts, fmt_default))
+    pub fn parse_attributes(attr: &[NestedMeta], fmt_default: &str) -> darling::Result<Self> {
+        OutputOptions::from_list(attr).map(|opts| Self::get_ok_err_streams(&opts, fmt_default))
     }
 
-    fn get_ok_err_streams(att: OutputOptions, fmt_default: String) -> Self {
-        let contained_ok_or_err = att.contains_ok_or_err();
-        let log_ts = att.log_ts();
+    fn get_ok_err_streams(att: &OutputOptions, fmt_default: &str) -> Self {
         let ok_log = att.ok_log();
         let err_log = att.err_log();
-        let mut fmt = att.fmt().unwrap_or(fmt_default);
-        if log_ts {
-            fmt += ", ts={:#?}"
-        };
+        let fmt_tmp = att.fmt().unwrap_or(fmt_default);
+        let log_ts = att.log_ts();
+        let fmt = if log_ts { fmt_tmp.to_owned() + ", ts={:#?}" } else { fmt_tmp.to_owned() };
 
         let ok_expr = match ok_log {
             Some(loglevel) => {
@@ -148,7 +137,7 @@ impl FormattedAttributes {
             }
             None => quote! {()},
         };
-        FormattedAttributes { ok_expr, err_expr, log_ts, contained_ok_or_err }
+        FormattedAttributes { ok_expr, err_expr, log_ts }
     }
 }
 
@@ -212,16 +201,12 @@ impl OutputOptions {
         self.named.err.as_ref().or_else(|| self.leading_level.as_ref())
     }
 
-    pub fn contains_ok_or_err(&self) -> bool {
-        self.named.ok.is_some() || self.named.err.is_some()
-    }
-
     pub fn log_ts(&self) -> bool {
         self.named.log_ts.unwrap_or(false)
     }
 
-    pub fn fmt(&self) -> Option<String> {
-        self.named.fmt.clone()
+    pub fn fmt(&self) -> Option<&str> {
+        self.named.fmt.as_ref().map(String::as_str)
     }
 }
 
@@ -300,18 +285,18 @@ fn replace_function_headers(original: ItemFn, new: &mut ItemFn) {
     new.block = block;
 }
 
-fn generate_function(closure: &ExprClosure, expressions: FormattedAttributes, result: bool) -> Result<ItemFn> {
-    let FormattedAttributes { ok_expr, err_expr, log_ts, contained_ok_or_err } = expressions;
-    let result = result || contained_ok_or_err;
-    let code = if log_ts {
+fn generate_function(closure: &ExprClosure, expressions: &FormattedAttributes, result: bool) -> Result<ItemFn> {
+    let FormattedAttributes { ok_expr, err_expr, log_ts } = expressions;
+    let code = if *log_ts {
         if result {
             quote! {
                 fn temp() {
                     let instant = std::time::Instant::now();
                     let result = (#closure)();
                     let ts = instant.elapsed();
-                    result.map(|result| { #ok_expr; result })
-                        .map_err(|err| { #err_expr; err })
+                    let result = result.map(|result| { #ok_expr; result })
+                        .map_err(|err| { #err_expr; err });
+                    result
                 }
             }
         } else {
@@ -329,8 +314,9 @@ fn generate_function(closure: &ExprClosure, expressions: FormattedAttributes, re
         quote! {
             fn temp() {
                 let result = (#closure)();
-                result.map(|result| { #ok_expr; result })
-                    .map_err(|err| { #err_expr; err })
+                let result = result.map(|result| { #ok_expr; result })
+                    .map_err(|err| { #err_expr; err });
+                result
             }
         }
     } else {
@@ -365,7 +351,7 @@ pub fn logfn(attr: proc_macro::TokenStream, item: proc_macro::TokenStream) -> pr
     let attr = parse_macro_input!(attr as AttributeArgs);
     let original_fn: ItemFn = parse_macro_input!(item as ItemFn);
     let fmt_default = original_fn.sig.ident.to_string() + "() => {:?}";
-    let parsed_attributes: FormattedAttributes = match FormattedAttributes::parse_attributes(&attr, fmt_default) {
+    let parsed_attributes: FormattedAttributes = match FormattedAttributes::parse_attributes(&attr, &fmt_default) {
         Ok(val) => val,
         Err(err) => {
             return err.write_errors().into();
@@ -373,7 +359,7 @@ pub fn logfn(attr: proc_macro::TokenStream, item: proc_macro::TokenStream) -> pr
     };
     let closure = make_closure(&original_fn);
     let is_result = check_if_return_result(&original_fn);
-    let mut new_fn = generate_function(&closure, parsed_attributes, is_result).expect("Failed Generating Function");
+    let mut new_fn = generate_function(&closure, &parsed_attributes, is_result).expect("Failed Generating Function");
     replace_function_headers(original_fn, &mut new_fn);
     new_fn.into_token_stream().into()
 }
@@ -422,10 +408,10 @@ fn log_fn_inputs(func: &ItemFn, attr: InputOptions) -> syn::Result<Stmt> {
         .iter()
         .cloned()
         .map(|arg| match arg {
-            FnArg::Receiver(arg) => arg.self_token.into(),
+            FnArg::Receiver(arg) => arg.self_token.into(), // self 的名称
             FnArg::Typed(pat_type) => {
                 if let Pat::Ident(ident) = *pat_type.pat {
-                    ident.ident
+                    ident.ident //变量的名称
                 } else {
                     unimplemented!()
                 }
@@ -442,7 +428,7 @@ fn log_fn_inputs(func: &ItemFn, attr: InputOptions) -> syn::Result<Stmt> {
         fmt.push('(');
 
         for input in inputs {
-            fmt.push_str(&input.to_string());
+            fmt.push_str(&input.to_string());//变量的名称
             fmt.push_str(": {:?},");
         }
         fmt.pop(); // Remove the extra comma.
@@ -450,8 +436,11 @@ fn log_fn_inputs(func: &ItemFn, attr: InputOptions) -> syn::Result<Stmt> {
         fmt
     });
 
+    // quote! 以外的代码都运行在编译的时候. 比如上述代码
+
+    //构造新的代码
     let res = quote! {
-        log::log!(#level, #fmt, #items);
+        log::log!(#level, #fmt, #items); // '#' 表示将变量嵌入到构造的代码中.
     };
     syn::parse2(res)
 }
